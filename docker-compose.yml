@@ -1,0 +1,145 @@
+# Kit de démonstration — Fondamentaux des architectures Data (M2i · Utopios)
+# Services : MinIO (stockage objet S3), Kafka (bus d'événements), Kafka UI,
+#            Spark 3.5 + Delta Lake (calcul), MLflow (suivi des modèles).
+name: demo-data
+
+services:
+
+  minio:
+    # MinIO a fermé l'accès public à ses images (docker.io/minio/minio et
+    # quay.io/minio/minio renvoient « access denied »). On utilise le miroir
+    # Bitnami, figé sur EXACTEMENT la même version : RELEASE.2025-04-22.
+    # La console web, retirée des versions MinIO plus récentes, y est présente.
+    image: bitnamilegacy/minio:2025.4.22-debian-12-r2
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin12345
+      MINIO_DEFAULT_BUCKETS: lake-raw,lakehouse,checkpoints
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # console web
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  minio-init:
+    image: bitnamilegacy/minio:2025.4.22-debian-12-r2
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    # L'image MinIO démarre le serveur une première fois pour sa configuration,
+    # l'ARRÊTE, puis le relance. Se connecter sans réessayer tombe au hasard
+    # dans cette fenêtre (« connection refused ») et fait échouer tout le
+    # démarrage, car spark attend ce service. D'où la boucle de reprise.
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 60); do
+        mc alias set local http://minio:9000 admin admin12345 >/dev/null 2>&1 && break
+        sleep 2
+      done &&
+      mc mb --ignore-existing local/lake-raw local/lakehouse local/checkpoints &&
+      echo 'Buckets prêts : lake-raw, lakehouse, checkpoints'
+      "
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    ports:
+      - "29092:29092"  # accès depuis le poste (facultatif)
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.1.0
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: distributeur
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8080:8080"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    container_name: mlflow
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+    # Publié sur 15000 et non sur 5000 : sur macOS, le récepteur AirPlay occupe
+    # le port 5000 par défaut, sur toutes les machines. Le port INTERNE reste
+    # 5000 (voir la commande ci-dessus et MLFLOW_TRACKING_URI) : seuls les accès
+    # depuis le navigateur du poste changent.
+    ports:
+      - "15000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+
+  spark:
+    build: ./spark
+    image: demo-data/spark-delta:1.0
+    container_name: spark
+    entrypoint: ["/bin/bash", "-c", "sleep infinity"]
+    user: root
+    working_dir: /workspace
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    environment:
+      # spark-defaults.conf fixe spark.sql.session.timeZone à Europe/Paris.
+      # Sans TZ ici, le conteneur reste en UTC : les horodatages écrits par
+      # Python (producteur Kafka, identifiants de lot) et ceux affichés par
+      # Spark diffèrent de deux heures, et les minutes du streaming ne
+      # correspondent plus à l'horloge de la salle.
+      TZ: Europe/Paris
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: admin12345
+      S3_ENDPOINT: http://minio:9000
+      KAFKA_BOOTSTRAP: kafka:9092
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      PYTHONPATH: /workspace/demos:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "4040:4040"   # Spark UI (1re application)
+      - "4041:4041"   # Spark UI (2e application en parallèle)
+      - "4042:4042"   # Spark UI (3e application en parallèle)
+    volumes:
+      - ./demos:/workspace/demos
+
+volumes:
+  minio-data:
+  kafka-data:
+  mlflow-data:

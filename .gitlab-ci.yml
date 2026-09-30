@@ -1,0 +1,33 @@
+# Pipeline DataOps de démonstration — à exécuter sur un runner GitLab de type « shell »
+# disposant de Docker et Docker Compose (tag : docker-shell).
+stages: [environnement, construction, qualite, nettoyage]
+
+default:
+  tags: [docker-shell]
+
+variables:
+  COMPOSE_PROJECT_NAME: "demo-data-ci-${CI_PIPELINE_ID}"
+
+environnement:
+  stage: environnement
+  script:
+    - docker compose build spark
+    - docker compose up -d --wait minio kafka mlflow
+    - docker compose up -d spark
+    - docker compose exec -T -e DEMO_SANS_PAUSE=1 spark python3 demos/01_generer_donnees.py
+
+construction:
+  stage: construction
+  script:
+    - docker compose exec -T -e DEMO_SANS_PAUSE=1 spark python3 demos/03_pipeline_batch.py
+
+tests-donnees:
+  stage: qualite
+  script:
+    - docker compose exec -T -e DEMO_SANS_PAUSE=1 spark python3 demos/09_tests_qualite.py
+
+nettoyage:
+  stage: nettoyage
+  when: always
+  script:
+    - docker compose down -v

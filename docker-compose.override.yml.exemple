@@ -1,0 +1,30 @@
+# Conflits de ports — à activer seulement si nécessaire :
+#     cp docker-compose.override.yml.exemple docker-compose.override.yml
+#
+# Docker Compose charge automatiquement docker-compose.override.yml s'il existe.
+# Ce fichier ne change QUE la publication côté poste : les scripts parlent aux
+# services par le réseau Docker (minio:9000, kafka:9092), la démo est identique.
+#
+# ATTENTION : « !override » est indispensable. Sans lui, Compose CONCATÈNE les
+# listes de ports au lieu de les remplacer, et le conflit persiste.
+#
+# Ports fréquemment déjà pris :
+#   8080  → très courant (Tomcat, autres conteneurs, proxys d'entreprise)
+#   9000  → php-fpm, SonarQube, Portainer…
+#            (un service lié à 127.0.0.1 seulement ne gêne PAS Docker)
+#
+# Avec ce fichier, les interfaces deviennent :
+#   Console MinIO  http://localhost:9001    (inchangée)
+#   Kafka UI       http://localhost:18081   (au lieu de 8080)
+#
+# MLflow n'y figure plus : le kit le publie déjà sur 15000, hors des ports
+# habituellement occupés.
+
+services:
+  minio:
+    ports: !override
+      - "19000:9000"   # API S3 (l'accès depuis le poste est facultatif)
+      - "9001:9001"    # console web
+  kafka-ui:
+    ports: !override
+      - "18081:8080"
